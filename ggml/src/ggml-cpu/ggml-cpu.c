@@ -1995,6 +1995,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
             } break;
+        case GGML_OP_SPARSE_ATTN:
+            {
+                ggml_compute_forward_sparse_attn(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
                 int32_t t = ggml_get_op_params_i32(tensor, 0);
@@ -2371,6 +2375,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_SPARSE_ATTN:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
@@ -2926,6 +2931,30 @@ struct ggml_cplan ggml_graph_plan(
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
                         cur += MAX(prefill, decode);
+                    } break;
+                case GGML_OP_SPARSE_ATTN:
+                    {
+                        // Scratch for SSA: bucket tables + candidate arrays + sort workspace
+                        // Scaled by n_threads for parallel processing
+                        const int64_t N   = node->src[0]->ne[2]; // n_batch (query positions)
+                        const int64_t M   = node->src[1]->ne[2]; // n_kv (key positions)
+                        const int64_t H   = node->src[0]->ne[1]; // n_head
+                        const int64_t DK  = node->src[0]->ne[0]; // head_dim
+                        const int32_t K   = ggml_get_op_params_i32(node, 1); // num_neighbors
+                        const int32_t R   = ggml_get_op_params_i32(node, 2); // num_hash_rounds
+                        const int32_t P   = ggml_get_op_params_i32(node, 3); // max_num_hashes
+                        const int32_t num_buckets = 1 << P;
+                        const int32_t C   = K * 4; // lsh_candidates
+
+                        // Per-thread: bucket tables (2 * num_buckets) + candidate arrays (N * R * C) + sort workspace (M)
+                        size_t per_thread = sizeof(int32_t) * (
+                            2 * num_buckets +      // bstart + bsize
+                            N * R * C +             // all_cand
+                            N * R * C +             // all_valid
+                            M +                     // sort permutation
+                            M                       // sort keys
+                        );
+                        cur += per_thread * n_tasks;
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {

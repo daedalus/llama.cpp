@@ -1516,7 +1516,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                                throw std::runtime_error(
                                    string_format("error: unknown value for --flash-attn: '%s'\n", value.c_str()));
                            }
-                       }).set_env("LLAMA_ARG_FLASH_ATTN"));
+                        }).set_env("LLAMA_ARG_FLASH_ATTN"));
+    // SSA (sparse self-attention) options
+    add_opt(common_arg({"--ssa-neighbors"}, "N",
+                       "enable SSA with N neighbors per query (0=disabled, default: 0)",
+                       [](common_params & params, const std::string & value) {
+                           params.ssa_num_neighbors = std::stoi(value);
+                       }));
+    add_opt(common_arg({"--ssa-window"}, "N",
+                       "SSA local window half-width (default: 8)",
+                       [](common_params & params, const std::string & value) {
+                           params.ssa_window_size = std::stoi(value);
+                       }));
+    add_opt(common_arg({"--ssa-global"}, "N",
+                       "SSA number of global tokens (default: 2)",
+                       [](common_params & params, const std::string & value) {
+                           params.ssa_num_global_tokens = std::stoi(value);
+                       }));
+    add_opt(common_arg({"--ssa-hash-rounds"}, "N",
+                       "SSA LSH hash rounds (default: 8)",
+                       [](common_params & params, const std::string & value) {
+                           params.ssa_num_hash_rounds = std::stoi(value);
+                       }));
     add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
         "prompt to start generation with; for system message, use -sys",

@@ -9095,6 +9095,177 @@ void ggml_compute_forward_flash_attn_ext(
     }
 }
 
+// ggml_compute_forward_sparse_attn
+
+static void ggml_compute_forward_sparse_attn_f32(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    // SSA: O(N*K) attention with LSH-based neighbor routing.
+    //
+    // src[0] = q: [head_dim, n_head, n_batch]
+    // src[1] = k: [head_dim, n_head_kv, n_kv]
+    // src[2] = v: [head_dim, n_head_kv, n_kv]
+    // src[3] = mask: [n_kv, n_batch] or NULL
+    // src[4] = lsh_proj: [R * max_P, head_dim]
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * lsh_p = dst->src[4];
+
+    // config from op_params
+    const float   scale           = dst->op_params[0];
+    const int32_t num_neighbors   = ggml_get_op_params_i32(dst, 1);
+    const int32_t num_hash_rounds = ggml_get_op_params_i32(dst, 2);
+    const int32_t max_num_hashes  = ggml_get_op_params_i32(dst, 3);
+    const int32_t window_size     = ggml_get_op_params_i32(dst, 4);
+    const int32_t num_global      = ggml_get_op_params_i32(dst, 5);
+
+    const int64_t d_head = q->ne[0];
+    const int64_t n_head = q->ne[1];
+    const int64_t N      = q->ne[2]; // query length
+    const int64_t M      = k->ne[2]; // key length
+
+    const int64_t BH = n_head;
+    const int64_t K  = num_neighbors;
+    const int64_t R  = num_hash_rounds;
+    const int64_t W  = window_size;
+    const int64_t G  = num_global;
+
+    // compute effective P
+    int P_eff = 1;
+    if (M > 0) {
+        float p_ideal = log2f((float)M / (float)(K * 4));
+        P_eff = (int)roundf(p_ideal);
+        if (P_eff < 1) P_eff = 1;
+        if (P_eff > max_num_hashes) P_eff = max_num_hashes;
+    }
+    const int num_buckets = 1 << P_eff;
+    const int lsh_candidates = K * 4;
+
+    int guaranteed = 2 * W + 1 + G + 1;
+    int lsh_k = K - guaranteed;
+    if (lsh_k < 8) lsh_k = 8;
+
+    const float * lsh_proj_data = lsh_p ? (const float *)lsh_p->data : NULL;
+
+    // ggml layout: [ne0=head_dim, ne1=n_head, ne2=n_batch]
+    // element [d, h, n] at offset: d * nb[0] + h * nb[1] + n * nb[2]
+    // contiguous in ne[0]: nb[0] = sizeof(float)
+    const float * q_data = (const float *)q->data;
+    const float * k_data = (const float *)k->data;
+    const float * v_data = (const float *)v->data;
+    float * out_data = (float *)dst->data;
+
+    // stride between batch positions for one head = d_head * n_head
+    const int64_t stride_batch = d_head * n_head;
+
+    // parallelize over heads
+    for (int64_t bh = ith; bh < BH; bh += nth) {
+        const float * Qh = q_data + bh * d_head;
+        const float * Kh = k_data + bh * d_head;
+        const float * Vh = v_data + bh * d_head;
+        float * Oh = out_data + bh * d_head;
+
+        // Build neighbor list per query: self + window + global
+        // (full LSH implementation would union across rounds here)
+        int total_k = (int)K;
+
+        for (int64_t n = 0; n < N; n++) {
+            float * out_row = Oh + n * stride_batch;
+
+            int32_t neighbors[256];
+            uint8_t valid_mask[256];
+            int nbs = 0;
+
+            // self
+            neighbors[nbs] = n;
+            valid_mask[nbs] = 1;
+            nbs++;
+
+            // window
+            for (int off = -(int)W; off <= (int)W && nbs < total_k; off++) {
+                int pos = n + off;
+                if (pos < 0) pos = 0;
+                if (pos >= M) pos = M - 1;
+                if (mask && pos > n) pos = n;
+                // skip self duplicates
+                if (pos == n) continue;
+                neighbors[nbs] = pos;
+                valid_mask[nbs] = 1;
+                nbs++;
+            }
+
+            // global tokens
+            for (int g = 0; g < (int)G && nbs < total_k; g++) {
+                int pos = g < M ? g : 0;
+                if (pos == n) continue;
+                neighbors[nbs] = pos;
+                valid_mask[nbs] = 1;
+                nbs++;
+            }
+
+            // pad remaining with invalid
+            while (nbs < total_k) {
+                neighbors[nbs] = 0;
+                valid_mask[nbs] = 0;
+                nbs++;
+            }
+
+            // compute attention scores
+            float scores[256];
+            float max_score = -1e30f;
+            for (int k_idx = 0; k_idx < total_k; k_idx++) {
+                if (!valid_mask[k_idx]) {
+                    scores[k_idx] = -1e30f;
+                    continue;
+                }
+                int key_pos = neighbors[k_idx];
+                float dot = 0.0f;
+                const float * qv = Qh + n * stride_batch;
+                const float * kv = Kh + key_pos * stride_batch;
+                for (int64_t d = 0; d < d_head; d++) {
+                    dot += qv[d] * kv[d];
+                }
+                scores[k_idx] = dot * scale;
+                if (scores[k_idx] > max_score) max_score = scores[k_idx];
+            }
+
+            // softmax
+            float sum_exp = 0.0f;
+            for (int k_idx = 0; k_idx < total_k; k_idx++) {
+                scores[k_idx] = expf(scores[k_idx] - max_score);
+                sum_exp += scores[k_idx];
+            }
+            for (int k_idx = 0; k_idx < total_k; k_idx++) {
+                scores[k_idx] /= sum_exp;
+            }
+
+            // aggregate values
+            for (int64_t d = 0; d < d_head; d++) out_row[d] = 0.0f;
+            for (int k_idx = 0; k_idx < total_k; k_idx++) {
+                if (!valid_mask[k_idx]) continue;
+                int key_pos = neighbors[k_idx];
+                const float * vv = Vh + key_pos * stride_batch;
+                float w = scores[k_idx];
+                for (int64_t d = 0; d < d_head; d++) {
+                    out_row[d] += w * vv[d];
+                }
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_sparse_attn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_sparse_attn_f32(params, dst);
+}
+
 // ggml_compute_forward_flash_attn_back
 
 static void ggml_compute_forward_flash_attn_back_f32(

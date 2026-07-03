@@ -13,6 +13,8 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <random>
+
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -2396,7 +2398,40 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
-    if (use_flash_attn) {
+
+    // SSA: sparse self-attention via LSH routing
+    // Check cparams overrides first, then hparams
+    const int32_t ssa_K = cparams.ssa_num_neighbors > 0 ? cparams.ssa_num_neighbors : hparams.ssa_num_neighbors;
+    if (ssa_K > 0 && kq_b == nullptr) {
+        const int32_t K  = ssa_K;
+        const int32_t R  = cparams.ssa_num_hash_rounds > 0 ? cparams.ssa_num_hash_rounds : hparams.ssa_num_hash_rounds;
+        const int32_t P  = hparams.ssa_max_num_hashes;
+        const int32_t W  = cparams.ssa_window_size > 0 ? cparams.ssa_window_size : hparams.ssa_window_size;
+        const int32_t G  = cparams.ssa_num_global_tokens > 0 ? cparams.ssa_num_global_tokens : hparams.ssa_num_global_tokens;
+        const int64_t DH = q->ne[0]; // head_dim
+
+        // LSH projection not needed for current CPU kernel (uses window+global+self only).
+        // Pass NULL — the kernel checks for NULL and skips LSH routing.
+        ggml_tensor * lsh_proj = NULL;
+
+        // ggml_sparse_attn expects:
+        // q: [head_dim, n_head, n_batch]
+        // k: [head_dim, n_head_kv, n_kv]  (expanded to n_head)
+        // v: [head_dim, n_head_kv, n_kv]  (expanded to n_head)
+        // Currently q/k/v are permuted to [head_dim, n_batch, n_head] after the permutes above.
+        // We need them in [head_dim, n_head, n_batch] format, so undo the permute for SSA.
+        ggml_tensor * q_ssa = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        ggml_tensor * k_ssa = ggml_permute(ctx0, k, 0, 2, 1, 3);
+        ggml_tensor * v_ssa = ggml_permute(ctx0, v, 0, 2, 1, 3);
+
+        cur = ggml_sparse_attn(ctx0, q_ssa, k_ssa, v_ssa, kq_mask, lsh_proj,
+                kq_scale, K, R, P, W, G);
+        GGML_ASSERT(cur != NULL && "ggml_sparse_attn returned NULL");
+        cb(cur, "ssa_attn", il);
+
+        // reshape back to [head_dim * n_head, n_batch] for output projection
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    } else if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
         if (v_trans) {

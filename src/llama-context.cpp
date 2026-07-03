@@ -197,6 +197,11 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
+    cparams.ssa_num_neighbors     = params.ssa_num_neighbors;
+    cparams.ssa_num_hash_rounds   = params.ssa_num_hash_rounds;
+    cparams.ssa_window_size       = params.ssa_window_size;
+    cparams.ssa_num_global_tokens = params.ssa_num_global_tokens;
+
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
@@ -3463,6 +3468,10 @@ llama_context_params llama_context_default_params() {
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
         /*.attention_type              =*/ LLAMA_ATTENTION_TYPE_UNSPECIFIED,
         /*.flash_attn_type             =*/ LLAMA_FLASH_ATTN_TYPE_AUTO,
+        /*.ssa_num_neighbors           =*/ 0,
+        /*.ssa_num_hash_rounds         =*/ 0,
+        /*.ssa_window_size             =*/ 0,
+        /*.ssa_num_global_tokens       =*/ 0,
         /*.rope_freq_base              =*/ 0.0f,
         /*.rope_freq_scale             =*/ 0.0f,
         /*.yarn_ext_factor             =*/ -1.0f,

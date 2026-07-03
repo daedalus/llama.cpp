@@ -352,6 +352,12 @@ extern "C" {
         enum llama_attention_type    attention_type;    // attention type to use for embeddings
         enum llama_flash_attn_type   flash_attn_type;   // when to enable Flash Attention
 
+        // SSA (sparse self-attention) - 0 means use model defaults
+        int32_t  ssa_num_neighbors;     // K: neighbor slots per query
+        int32_t  ssa_num_hash_rounds;   // R: LSH hash rounds
+        int32_t  ssa_window_size;       // W: local window half-width
+        int32_t  ssa_num_global_tokens; // G: global tokens
+
         // ref: https://github.com/ggml-org/llama.cpp/pull/2054
         float    rope_freq_base;   // RoPE base frequency, 0 = from model
         float    rope_freq_scale;  // RoPE frequency scaling factor, 0 = from model

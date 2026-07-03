@@ -1076,9 +1076,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "SPARSE_ATTN",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1187,9 +1189,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "sparse_attn(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5437,6 +5441,56 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+// ggml_sparse_attn
+
+struct ggml_tensor * ggml_sparse_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * lsh_proj,
+        float                 scale,
+        int32_t               num_neighbors,
+        int32_t               num_hash_rounds,
+        int32_t               max_num_hashes,
+        int32_t               window_size,
+        int32_t               num_global_tokens) {
+    // q: [head_dim, n_head, n_batch]
+    // k: [head_dim, n_head_kv, n_kv]  (already expanded to n_head)
+    // v: [head_dim, n_head_kv, n_kv]  (already expanded to n_head)
+    // mask: [n_kv, n_batch] or NULL
+    // lsh_proj: [R * max_P, head_dim]
+
+    GGML_ASSERT(q->ne[3] == k->ne[3]);
+    GGML_ASSERT(q->ne[3] == v->ne[3]);
+
+    // output: [head_dim, n_head, n_batch] -- same shape as Q
+    int64_t ne[4] = { q->ne[0], q->ne[1], q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    // op_params: 6 floats packed as int32 for portability
+    // [0] = scale (as bit pattern)
+    // [1..5] = num_neighbors, num_hash_rounds, max_num_hashes, window_size, num_global_tokens
+    float params[6];
+    params[0] = scale;
+    memcpy(&params[1], &num_neighbors, sizeof(int32_t));
+    memcpy(&params[2], &num_hash_rounds, sizeof(int32_t));
+    memcpy(&params[3], &max_num_hashes, sizeof(int32_t));
+    memcpy(&params[4], &window_size, sizeof(int32_t));
+    memcpy(&params[5], &num_global_tokens, sizeof(int32_t));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_SPARSE_ATTN;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = mask;
+    result->src[4] = lsh_proj;
+
+    return result;
 }
 
 // ggml_flash_attn_back

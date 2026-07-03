@@ -47,6 +47,12 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    // SSA (sparse self-attention) - 0 means use model defaults from hparams
+    int32_t ssa_num_neighbors;
+    int32_t ssa_num_hash_rounds;
+    int32_t ssa_window_size;
+    int32_t ssa_num_global_tokens;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

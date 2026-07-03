@@ -227,6 +227,17 @@ struct llama_hparams {
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
 
+    // SSA (sparse self-attention, LSH-based)
+    // When ssa_num_neighbors > 0, SSA is enabled for all layers.
+    // LSH projections are generated from ssa_lsh_seed at runtime.
+    uint32_t ssa_num_neighbors     = 0;    // K: neighbor slots per query (0 = disabled)
+    uint32_t ssa_num_hash_rounds   = 8;    // R: independent LSH hash rounds
+    uint32_t ssa_max_num_hashes    = 12;   // P: ceiling on LSH planes per round
+    uint32_t ssa_window_size       = 8;    // W: local window half-width
+    uint32_t ssa_num_global_tokens = 2;    // G: leading tokens all queries attend to
+    uint32_t ssa_rebuild_interval  = 32;   // rebuild neighbor graph every N tokens
+    int64_t  ssa_lsh_seed          = 42;   // seed for random LSH projections
+
     // DeepSeek-V4
     uint32_t dsv4_o_group_count        = 0;
     uint32_t dsv4_o_lora_rank          = 0;
@@ -299,6 +310,9 @@ struct llama_hparams {
 
     // return true if one of the layers is SWA
     bool is_swa_any() const;
+
+    // return true if SSA is enabled (ssa_num_neighbors > 0)
+    bool is_ssa() const { return ssa_num_neighbors > 0; }
 
     bool is_swa(uint32_t il) const;
 

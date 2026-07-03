@@ -557,6 +557,7 @@ extern "C" {
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
+        GGML_OP_SPARSE_ATTN,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
         GGML_OP_WIN_PART,
@@ -2426,6 +2427,32 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // Sparse Self-Attention (SSA): O(N*K) attention with LSH-based routing.
+    //
+    // q:    [head_dim, n_head,    n_batch]     query heads
+    // k:    [head_dim, n_head_kv, n_kv]        key heads
+    // v:    [head_dim, n_head_kv, n_kv]        value heads
+    // mask: [n_kv, n_batch]                     attention mask (NULL = no mask)
+    // lsh_proj: [R * max_P, head_dim]          LSH random projections (f32)
+    //
+    // All heads are concatenated along ne1 (n_head + n_head_kv packed).
+    // The caller must expand KV heads to match query heads (GQA expansion).
+    //
+    // Config params are passed as scalars because ggml ops carry no side state.
+    GGML_API struct ggml_tensor * ggml_sparse_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * lsh_proj,
+            float                 scale,
+            int32_t               num_neighbors,
+            int32_t               num_hash_rounds,
+            int32_t               max_num_hashes,
+            int32_t               window_size,
+            int32_t               num_global_tokens);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

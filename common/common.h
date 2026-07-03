@@ -494,6 +494,12 @@ struct common_params {
     enum llama_attention_type    attention_type    = LLAMA_ATTENTION_TYPE_UNSPECIFIED; // attention type for embeddings
     enum llama_flash_attn_type   flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_AUTO; // whether to use Flash Attention
 
+    // SSA (sparse self-attention) - overrides model hparams when > 0
+    int32_t ssa_num_neighbors     = 0;    // K: neighbor slots per query (0 = use model default)
+    int32_t ssa_num_hash_rounds   = 0;    // R: LSH hash rounds (0 = use model default)
+    int32_t ssa_window_size       = 0;    // W: local window half-width (0 = use model default)
+    int32_t ssa_num_global_tokens = 0;    // G: global tokens (0 = use model default)
+
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
     struct common_params_vocoder     vocoder;

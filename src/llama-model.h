@@ -271,6 +271,11 @@ struct llama_layer {
     struct ggml_tensor * wo_enc    = nullptr;
     struct ggml_tensor * wqkv_gate = nullptr;
 
+    // SSA (sparse self-attention) LSH projections
+    // Shape: [R * max_P, d_head] -- random hyperplanes for locality-sensitive hashing
+    // Generated from ssa_lsh_seed during model loading, not learned.
+    struct ggml_tensor * ssa_lsh_proj = nullptr;
+
     // relative position bias
     struct ggml_tensor * attn_rel_b       = nullptr;
     struct ggml_tensor * attn_rel_b_enc   = nullptr;
