@@ -342,6 +342,10 @@ struct cmd_params {
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
     std::vector<llama_flash_attn_type> flash_attn;
+    std::vector<int>                 ssa_num_neighbors;
+    std::vector<int>                 ssa_window;
+    std::vector<int>                 ssa_global;
+    std::vector<int>                 ssa_hash_rounds;
     std::vector<std::vector<ggml_backend_dev_t>> devices;
     std::vector<std::vector<float>>  tensor_split;
     std::vector<std::vector<llama_model_tensor_buft_override>> tensor_buft_overrides;
@@ -387,6 +391,10 @@ static const cmd_params cmd_params_defaults = {
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
+    /* ssa_num_neighbors    */ { 0 },
+    /* ssa_window           */ { 0 },
+    /* ssa_global           */ { 0 },
+    /* ssa_hash_rounds      */ { 0 },
     /* devices              */ { {} },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
     /* tensor_buft_overrides*/ { std::vector<llama_model_tensor_buft_override>{ { nullptr, nullptr } } },
@@ -459,6 +467,10 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -mg, --main-gpu <i>                         (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>             (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
+    printf("  --ssa-neighbors <n>                         SSA neighbor slots per query, 0=disabled (default: %d)\n", cmd_params_defaults.ssa_num_neighbors[0]);
+    printf("  --ssa-window <n>                            SSA local window half-width (default: %d)\n", cmd_params_defaults.ssa_window[0]);
+    printf("  --ssa-global <n>                            SSA global tokens (default: %d)\n", cmd_params_defaults.ssa_global[0]);
+    printf("  --ssa-hash-rounds <n>                       SSA LSH hash rounds (default: %d)\n", cmd_params_defaults.ssa_hash_rounds[0]);
     printf("  -dev, --device <dev0/dev1/...>              (default: auto)\n");
     printf("  -mmp, --mmap <0|1>                          (default: %s)\n", join(cmd_params_defaults.use_mmap, ",").c_str());
     printf("  -dio, --direct-io <0|1>                     (default: %s)\n", join(cmd_params_defaults.use_direct_io, ",").c_str());
@@ -823,6 +835,34 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.flash_attn.insert(params.flash_attn.end(), types.begin(), types.end());
+            } else if (arg == "--ssa-neighbors") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.ssa_num_neighbors.insert(params.ssa_num_neighbors.end(), p.begin(), p.end());
+            } else if (arg == "--ssa-window") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.ssa_window.insert(params.ssa_window.end(), p.begin(), p.end());
+            } else if (arg == "--ssa-global") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.ssa_global.insert(params.ssa_global.end(), p.begin(), p.end());
+            } else if (arg == "--ssa-hash-rounds") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.ssa_hash_rounds.insert(params.ssa_hash_rounds.end(), p.begin(), p.end());
             } else if (arg == "-mmp" || arg == "--mmap") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1101,6 +1141,18 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.flash_attn.empty()) {
         params.flash_attn = cmd_params_defaults.flash_attn;
     }
+    if (params.ssa_num_neighbors.empty()) {
+        params.ssa_num_neighbors = cmd_params_defaults.ssa_num_neighbors;
+    }
+    if (params.ssa_window.empty()) {
+        params.ssa_window = cmd_params_defaults.ssa_window;
+    }
+    if (params.ssa_global.empty()) {
+        params.ssa_global = cmd_params_defaults.ssa_global;
+    }
+    if (params.ssa_hash_rounds.empty()) {
+        params.ssa_hash_rounds = cmd_params_defaults.ssa_hash_rounds;
+    }
     if (params.devices.empty()) {
         params.devices = cmd_params_defaults.devices;
     }
@@ -1166,6 +1218,10 @@ struct cmd_params_instance {
     int                main_gpu;
     bool               no_kv_offload;
     llama_flash_attn_type flash_attn;
+    int                ssa_num_neighbors;
+    int                ssa_window;
+    int                ssa_global;
+    int                ssa_hash_rounds;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float> tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
@@ -1249,8 +1305,12 @@ struct cmd_params_instance {
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
-        cparams.flash_attn_type = flash_attn;
-        cparams.embeddings      = embeddings;
+        cparams.flash_attn_type      = flash_attn;
+        cparams.ssa_num_neighbors    = ssa_num_neighbors;
+        cparams.ssa_window_size      = ssa_window;
+        cparams.ssa_num_global_tokens = ssa_global;
+        cparams.ssa_num_hash_rounds  = ssa_hash_rounds;
+        cparams.embeddings           = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
 
@@ -1284,6 +1344,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & tv : params.type_v)
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & fa : params.flash_attn)
+    for (const auto & ssa_k : params.ssa_num_neighbors)
+    for (const auto & ssa_w : params.ssa_window)
+    for (const auto & ssa_g : params.ssa_global)
+    for (const auto & ssa_r : params.ssa_hash_rounds)
     for (const auto & nt : params.n_threads)
     for (const auto & cm : params.cpu_mask)
     for (const auto & cs : params.cpu_strict)
@@ -1312,6 +1376,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
+                /* .ssa_num_neighbors = */ ssa_k,
+                /* .ssa_window        = */ ssa_w,
+                /* .ssa_global        = */ ssa_g,
+                /* .ssa_hash_rounds   = */ ssa_r,
                 /* .devices      = */ devs,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
@@ -1349,6 +1417,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
+                /* .ssa_num_neighbors = */ ssa_k,
+                /* .ssa_window        = */ ssa_w,
+                /* .ssa_global        = */ ssa_g,
+                /* .ssa_hash_rounds   = */ ssa_r,
                 /* .devices      = */ devs,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
@@ -1386,6 +1458,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
+                /* .ssa_num_neighbors = */ ssa_k,
+                /* .ssa_window        = */ ssa_w,
+                /* .ssa_global        = */ ssa_g,
+                /* .ssa_hash_rounds   = */ ssa_r,
                 /* .devices      = */ devs,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
@@ -1428,6 +1504,10 @@ struct test {
     int                      main_gpu;
     bool                     no_kv_offload;
     llama_flash_attn_type    flash_attn;
+    int                      ssa_num_neighbors;
+    int                      ssa_window;
+    int                      ssa_global;
+    int                      ssa_hash_rounds;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float>       tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
@@ -1468,6 +1548,10 @@ struct test {
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
         flash_attn     = inst.flash_attn;
+        ssa_num_neighbors = inst.ssa_num_neighbors;
+        ssa_window     = inst.ssa_window;
+        ssa_global     = inst.ssa_global;
+        ssa_hash_rounds = inst.ssa_hash_rounds;
         devices        = inst.devices;
         tensor_split   = inst.tensor_split;
         tensor_buft_overrides = inst.tensor_buft_overrides;
@@ -1533,7 +1617,8 @@ struct test {
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
-            "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
+            "main_gpu",       "no_kv_offload",  "flash_attn",    "ssa_num_neighbors", "ssa_window",
+            "ssa_global",     "ssa_hash_rounds", "devices",       "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
             "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
@@ -1549,7 +1634,8 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" ||
+            field == "ssa_num_neighbors" || field == "ssa_window" || field == "ssa_global" || field == "ssa_hash_rounds") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
@@ -1622,6 +1708,10 @@ struct test {
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
                                             std::to_string((int) flash_attn),
+                                            std::to_string(ssa_num_neighbors),
+                                            std::to_string(ssa_window),
+                                            std::to_string(ssa_global),
+                                            std::to_string(ssa_hash_rounds),
                                             devices_to_string(devices),
                                             tensor_split_str,
                                             tensor_buft_overrides_str,
@@ -1808,6 +1898,18 @@ struct markdown_printer : public printer {
         if (field == "flash_attn") {
             return 3;
         }
+        if (field == "ssa_num_neighbors") {
+            return 5;
+        }
+        if (field == "ssa_window") {
+            return 4;
+        }
+        if (field == "ssa_global") {
+            return 4;
+        }
+        if (field == "ssa_hash_rounds") {
+            return 5;
+        }
         if (field == "devices") {
             return -12;
         }
@@ -1850,6 +1952,18 @@ struct markdown_printer : public printer {
         }
         if (field == "flash_attn") {
             return "fa";
+        }
+        if (field == "ssa_num_neighbors") {
+            return "ssa_k";
+        }
+        if (field == "ssa_window") {
+            return "ssa_w";
+        }
+        if (field == "ssa_global") {
+            return "ssa_g";
+        }
+        if (field == "ssa_hash_rounds") {
+            return "ssa_r";
         }
         if (field == "use_mmap") {
             return "mmap";
@@ -1934,6 +2048,18 @@ struct markdown_printer : public printer {
         }
         if (params.flash_attn.size() > 1 || params.flash_attn != cmd_params_defaults.flash_attn) {
             fields.emplace_back("flash_attn");
+        }
+        if (params.ssa_num_neighbors.size() > 1 || params.ssa_num_neighbors != cmd_params_defaults.ssa_num_neighbors) {
+            fields.emplace_back("ssa_num_neighbors");
+        }
+        if (params.ssa_window.size() > 1 || params.ssa_window != cmd_params_defaults.ssa_window) {
+            fields.emplace_back("ssa_window");
+        }
+        if (params.ssa_global.size() > 1 || params.ssa_global != cmd_params_defaults.ssa_global) {
+            fields.emplace_back("ssa_global");
+        }
+        if (params.ssa_hash_rounds.size() > 1 || params.ssa_hash_rounds != cmd_params_defaults.ssa_hash_rounds) {
+            fields.emplace_back("ssa_hash_rounds");
         }
         if (params.devices.size() > 1 || params.devices != cmd_params_defaults.devices) {
             fields.emplace_back("devices");

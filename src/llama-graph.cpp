@@ -2402,6 +2402,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // SSA: sparse self-attention via LSH routing
     // Check cparams overrides first, then hparams
     const int32_t ssa_K = cparams.ssa_num_neighbors > 0 ? cparams.ssa_num_neighbors : hparams.ssa_num_neighbors;
+    if (il == 0) {
+        LLAMA_LOG_INFO("%s: SSA check: cparams.ssa_num_neighbors=%d, hparams.ssa_num_neighbors=%u, ssa_K=%d, kq_b=%p\n",
+                __func__, cparams.ssa_num_neighbors, hparams.ssa_num_neighbors, ssa_K, (void*)kq_b);
+    }
     if (ssa_K > 0 && kq_b == nullptr) {
         const int32_t K  = ssa_K;
         const int32_t R  = cparams.ssa_num_hash_rounds > 0 ? cparams.ssa_num_hash_rounds : hparams.ssa_num_hash_rounds;
