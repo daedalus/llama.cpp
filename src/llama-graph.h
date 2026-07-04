@@ -281,6 +281,22 @@ public:
     const llama_cross * cross;
 };
 
+class llm_graph_input_ssa_lsh_proj : public llm_graph_input_i {
+public:
+    llm_graph_input_ssa_lsh_proj(const float * data, int64_t size)
+        : data(data), size(size) {}
+    virtual ~llm_graph_input_ssa_lsh_proj() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & /*params*/) override { return true; }
+
+    ggml_tensor * ssa_lsh_proj = nullptr;
+
+    const float * data;
+    int64_t size;
+};
+
 class llm_graph_input_attn_no_cache : public llm_graph_input_i {
 public:
     llm_graph_input_attn_no_cache(const llama_hparams & hparams, const llama_cparams & cparams) :

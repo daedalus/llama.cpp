@@ -387,6 +387,14 @@ void llm_graph_input_cross_embd::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_ssa_lsh_proj::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    if (ssa_lsh_proj && data && size > 0) {
+        ggml_backend_tensor_set(ssa_lsh_proj, data, 0, size * sizeof(float));
+    }
+}
+
 template <typename T>
 static void print_mask(const T * data, int64_t n_tokens, int64_t n_kv, int64_t n_swa, llama_swa_type swa_type) {
     LLAMA_LOG_DEBUG("%s: === Attention mask ===\n", __func__);
@@ -2422,9 +2430,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         const int64_t proj_offset = (int64_t)il * R * P * DH;
         GGML_ASSERT((int64_t)hparams.ssa_lsh_proj.size() >= proj_offset + proj_rows * proj_cols
                 && "SSA LSH projection data not precomputed for this layer");
-        ggml_tensor * lsh_proj = ggml_new_tensor(ctx0, GGML_TYPE_F32, 2,
+        auto inp_lsh = std::make_unique<llm_graph_input_ssa_lsh_proj>(
+                hparams.ssa_lsh_proj.data() + proj_offset, proj_rows * proj_cols);
+        inp_lsh->ssa_lsh_proj = ggml_new_tensor(ctx0, GGML_TYPE_F32, 2,
                 (int64_t[]){ proj_cols, proj_rows, 1, 1 });
-        ggml_set_tensor_data(lsh_proj, (void *)(hparams.ssa_lsh_proj.data() + proj_offset));
+        ggml_set_input(inp_lsh->ssa_lsh_proj);
+        ggml_tensor * lsh_proj = inp_lsh->ssa_lsh_proj;
+        res->add_input(std::move(inp_lsh));
 
         // ggml_sparse_attn expects:
         // q: [head_dim, n_head, n_batch]
