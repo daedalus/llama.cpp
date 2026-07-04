@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cassert>
+#include <vector>
 
 // bump if necessary
 #define LLAMA_MAX_LAYERS  512
@@ -237,6 +238,9 @@ struct llama_hparams {
     uint32_t ssa_num_global_tokens = 2;    // G: leading tokens all queries attend to
     uint32_t ssa_rebuild_interval  = 32;   // rebuild neighbor graph every N tokens
     int64_t  ssa_lsh_seed          = 42;   // seed for random LSH projections
+    // Precomputed LSH projection data: [n_layer * R * max_P * d_head] floats.
+    // Computed once at context init, one independent seed per layer.
+    std::vector<float> ssa_lsh_proj;
 
     // DeepSeek-V4
     uint32_t dsv4_o_group_count        = 0;

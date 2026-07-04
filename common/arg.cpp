@@ -1534,9 +1534,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                            params.ssa_num_global_tokens = std::stoi(value);
                        }));
     add_opt(common_arg({"--ssa-hash-rounds"}, "N",
-                       "SSA LSH hash rounds (default: 8)",
+                       "SSA LSH hash rounds (default: 8, max: 8)",
                        [](common_params & params, const std::string & value) {
-                           params.ssa_num_hash_rounds = std::stoi(value);
+                           params.ssa_num_hash_rounds = std::min(std::stoi(value), 8);
                        }));
     add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",

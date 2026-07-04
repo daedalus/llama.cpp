@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <random>
 #include <stdexcept>
 
 //
@@ -201,6 +202,42 @@ llama_context::llama_context(
     cparams.ssa_num_hash_rounds   = params.ssa_num_hash_rounds;
     cparams.ssa_window_size       = params.ssa_window_size;
     cparams.ssa_num_global_tokens = params.ssa_num_global_tokens;
+
+    // Precompute LSH projection matrices once at context init (not per graph build).
+    // Each layer gets an independent seed for different hyperplanes.
+    {
+        const uint32_t ssa_K = cparams.ssa_num_neighbors > 0 ? cparams.ssa_num_neighbors : hparams.ssa_num_neighbors;
+        if (ssa_K > 0) {
+            const int R = cparams.ssa_num_hash_rounds > 0 ? cparams.ssa_num_hash_rounds : hparams.ssa_num_hash_rounds;
+            const int P = hparams.ssa_max_num_hashes;
+            const int n_layer = hparams.n_layer();
+            const int d_head = hparams.n_embd / hparams.n_head(0);
+            const int64_t total = (int64_t)n_layer * R * P * d_head;
+            hparams.ssa_lsh_proj.resize(total);
+            for (int il = 0; il < n_layer; il++) {
+                std::mt19937 rng(hparams.ssa_lsh_seed + il);
+                std::normal_distribution<float> dist(0.0f, 1.0f);
+                float * base = hparams.ssa_lsh_proj.data() + (int64_t)il * R * P * d_head;
+                for (int r = 0; r < R * P; r++) {
+                    float norm = 0.0f;
+                    for (int d = 0; d < d_head; d++) {
+                        float v = dist(rng);
+                        base[r * d_head + d] = v;
+                        norm += v * v;
+                    }
+                    norm = sqrtf(norm);
+                    if (norm > 1e-12f) {
+                        for (int d = 0; d < d_head; d++) {
+                            base[r * d_head + d] /= norm;
+                        }
+                    }
+                }
+            }
+            LLAMA_LOG_INFO("%s: SSA: precomputed LSH projections for %d layers "
+                    "(R=%d, P=%d, d_head=%d, seed=%lld)\n",
+                    __func__, n_layer, R, P, d_head, (long long)hparams.ssa_lsh_seed);
+        }
+    }
 
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;

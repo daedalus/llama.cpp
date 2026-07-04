@@ -13,8 +13,6 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
-#include <random>
-
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -2418,31 +2416,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         const int32_t G  = cparams.ssa_num_global_tokens > 0 ? cparams.ssa_num_global_tokens : hparams.ssa_num_global_tokens;
         const int64_t DH = q->ne[0]; // head_dim
 
-        // Generate LSH random projection matrix: [R * max_P, head_dim]
-        // Normalized Gaussian vectors used for hyperplane hashing.
+        // Reference precomputed LSH projection matrix from hparams (computed once at context init).
         const int64_t proj_rows = (int64_t)R * P;
         const int64_t proj_cols = DH;
+        const int64_t proj_offset = (int64_t)il * R * P * DH;
+        GGML_ASSERT((int64_t)hparams.ssa_lsh_proj.size() >= proj_offset + proj_rows * proj_cols
+                && "SSA LSH projection data not precomputed for this layer");
         ggml_tensor * lsh_proj = ggml_new_tensor(ctx0, GGML_TYPE_F32, 2,
                 (int64_t[]){ proj_cols, proj_rows, 1, 1 });
-        {
-            std::mt19937 rng(hparams.ssa_lsh_seed);
-            std::normal_distribution<float> dist(0.0f, 1.0f);
-            float * data = (float *)lsh_proj->data;
-            for (int64_t r = 0; r < proj_rows; r++) {
-                float norm = 0.0f;
-                for (int64_t d = 0; d < proj_cols; d++) {
-                    float v = dist(rng);
-                    data[r * proj_cols + d] = v;
-                    norm += v * v;
-                }
-                norm = sqrtf(norm);
-                if (norm > 1e-12f) {
-                    for (int64_t d = 0; d < proj_cols; d++) {
-                        data[r * proj_cols + d] /= norm;
-                    }
-                }
-            }
-        }
+        ggml_set_tensor_data(lsh_proj, (void *)(hparams.ssa_lsh_proj.data() + proj_offset));
 
         // ggml_sparse_attn expects:
         // q: [head_dim, n_head, n_batch]

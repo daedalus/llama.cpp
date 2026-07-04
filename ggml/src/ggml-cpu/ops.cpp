@@ -9184,6 +9184,8 @@ static void ggml_compute_forward_sparse_attn_f32(
 
         const bool use_lsh = lsh_proj_data != NULL && R > 0;
 
+        GGML_ASSERT(R <= 8 && "SSA LSH: num_hash_rounds > 8 exceeds stack buffer capacity");
+
         // P_eff targets average bucket occupancy ~ lsh_k (the LSH residual
         // budget after subtracting window+global+self from K). This matches
         // the Python reference's compute_effective_p(M, C=lsh_k*4, max_p).
@@ -9200,17 +9202,34 @@ static void ggml_compute_forward_sparse_attn_f32(
         }
         const int num_buckets = 1 << P_eff;
 
-        // Heap-allocate large tables when M > 4096 to avoid stack overflow.
-        // At M <= 4096 (the common case), use stack for zero-alloc fast path.
-        const bool large_seq = M > 4096;
-        GGML_ASSERT(!large_seq && "SSA LSH: sequence length > 4096 not yet supported");
-
         // Per-round bucket tables: built once per head, queried per query.
-        // bstart/bsize indexed as [round * num_buckets + bucket_id].
-        // k_sorted_pos indexed as [round * M + position].
-        int32_t bstart[4096 * 8];    // max R=8 rounds * 4096 buckets
-        int32_t bsize_arr[4096 * 8];
-        int32_t k_sorted_pos[4096 * 8]; // R * M sort permutations
+        // Stack for M <= 4096 (common case), heap for larger sequences.
+        static const int SSA_STACK_M = 4096;
+        const bool use_heap = M > SSA_STACK_M;
+
+        int32_t * bstart       = NULL;
+        int32_t * bsize_arr    = NULL;
+        int32_t * k_sorted_pos = NULL;
+        int32_t * bk_ids       = NULL;
+
+        int32_t bstart_stack[SSA_STACK_M * 8];
+        int32_t bsize_stack[SSA_STACK_M * 8];
+        int32_t kspos_stack[SSA_STACK_M * 8];
+        int32_t bkids_stack[SSA_STACK_M];
+
+        if (use_heap) {
+            bstart       = (int32_t *)malloc(sizeof(int32_t) * num_buckets * (int)R);
+            bsize_arr    = (int32_t *)malloc(sizeof(int32_t) * num_buckets * (int)R);
+            k_sorted_pos = (int32_t *)malloc(sizeof(int32_t) * M * (int)R);
+            bk_ids       = (int32_t *)malloc(sizeof(int32_t) * M);
+            GGML_ASSERT(bstart && bsize_arr && k_sorted_pos && bk_ids
+                    && "SSA LSH: heap allocation failed");
+        } else {
+            bstart       = bstart_stack;
+            bsize_arr    = bsize_stack;
+            k_sorted_pos = kspos_stack;
+            bk_ids       = bkids_stack;
+        }
 
         if (use_lsh) {
             for (int r = 0; r < (int)R; r++) {
@@ -9219,7 +9238,6 @@ static void ggml_compute_forward_sparse_attn_f32(
                 int32_t * kspos = k_sorted_pos + r * (int)M;
 
                 // hash all keys, build (bucket_id, position) pairs
-                int32_t bk_ids[4096];
                 for (int64_t m = 0; m < M; m++) {
                     bk_ids[m] = ssa_lsh_hash(Kh + m * stride_batch, round_proj, d_head, P_eff);
                     kspos[m] = m;
@@ -9371,6 +9389,13 @@ static void ggml_compute_forward_sparse_attn_f32(
                     out_row[d] += w * vv[d];
                 }
             }
+        }
+
+        if (use_heap) {
+            free(bstart);
+            free(bsize_arr);
+            free(k_sorted_pos);
+            free(bk_ids);
         }
     }
 }
