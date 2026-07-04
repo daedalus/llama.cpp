@@ -5457,7 +5457,8 @@ struct ggml_tensor * ggml_sparse_attn(
         int32_t               num_hash_rounds,
         int32_t               max_num_hashes,
         int32_t               window_size,
-        int32_t               num_global_tokens) {
+        int32_t               num_global_tokens,
+        int32_t               causal) {
     // q: [head_dim, n_head, n_batch]
     // k: [head_dim, n_head_kv, n_kv]  (already expanded to n_head)
     // v: [head_dim, n_head_kv, n_kv]  (already expanded to n_head)
@@ -5471,16 +5472,18 @@ struct ggml_tensor * ggml_sparse_attn(
     int64_t ne[4] = { q->ne[0], q->ne[1], q->ne[2], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
-    // op_params: 6 floats packed as int32 for portability
+    // op_params: 7 floats packed as int32 for portability
     // [0] = scale (as bit pattern)
     // [1..5] = num_neighbors, num_hash_rounds, max_num_hashes, window_size, num_global_tokens
-    float params[6];
+    // [6] = causal
+    float params[7];
     params[0] = scale;
     memcpy(&params[1], &num_neighbors, sizeof(int32_t));
     memcpy(&params[2], &num_hash_rounds, sizeof(int32_t));
     memcpy(&params[3], &max_num_hashes, sizeof(int32_t));
     memcpy(&params[4], &window_size, sizeof(int32_t));
     memcpy(&params[5], &num_global_tokens, sizeof(int32_t));
+    memcpy(&params[6], &causal, sizeof(int32_t));
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_SPARSE_ATTN;

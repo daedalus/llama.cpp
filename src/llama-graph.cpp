@@ -2403,8 +2403,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // Check cparams overrides first, then hparams
     const int32_t ssa_K = cparams.ssa_num_neighbors > 0 ? cparams.ssa_num_neighbors : hparams.ssa_num_neighbors;
     if (il == 0) {
-        LLAMA_LOG_INFO("%s: SSA check: cparams.ssa_num_neighbors=%d, hparams.ssa_num_neighbors=%u, ssa_K=%d, kq_b=%p\n",
-                __func__, cparams.ssa_num_neighbors, hparams.ssa_num_neighbors, ssa_K, (void*)kq_b);
+        LLAMA_LOG_INFO("%s: SSA: K=%d R=%d P=%d W=%d G=%d, LSH enabled\n",
+                __func__, ssa_K,
+                cparams.ssa_num_hash_rounds > 0 ? cparams.ssa_num_hash_rounds : hparams.ssa_num_hash_rounds,
+                hparams.ssa_max_num_hashes,
+                cparams.ssa_window_size > 0 ? cparams.ssa_window_size : hparams.ssa_window_size,
+                cparams.ssa_num_global_tokens > 0 ? cparams.ssa_num_global_tokens : hparams.ssa_num_global_tokens);
     }
     if (ssa_K > 0 && kq_b == nullptr) {
         const int32_t K  = ssa_K;
@@ -2414,9 +2418,31 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         const int32_t G  = cparams.ssa_num_global_tokens > 0 ? cparams.ssa_num_global_tokens : hparams.ssa_num_global_tokens;
         const int64_t DH = q->ne[0]; // head_dim
 
-        // LSH projection not needed for current CPU kernel (uses window+global+self only).
-        // Pass NULL — the kernel checks for NULL and skips LSH routing.
-        ggml_tensor * lsh_proj = NULL;
+        // Generate LSH random projection matrix: [R * max_P, head_dim]
+        // Normalized Gaussian vectors used for hyperplane hashing.
+        const int64_t proj_rows = (int64_t)R * P;
+        const int64_t proj_cols = DH;
+        ggml_tensor * lsh_proj = ggml_new_tensor(ctx0, GGML_TYPE_F32, 2,
+                (int64_t[]){ proj_cols, proj_rows, 1, 1 });
+        {
+            std::mt19937 rng(hparams.ssa_lsh_seed);
+            std::normal_distribution<float> dist(0.0f, 1.0f);
+            float * data = (float *)lsh_proj->data;
+            for (int64_t r = 0; r < proj_rows; r++) {
+                float norm = 0.0f;
+                for (int64_t d = 0; d < proj_cols; d++) {
+                    float v = dist(rng);
+                    data[r * proj_cols + d] = v;
+                    norm += v * v;
+                }
+                norm = sqrtf(norm);
+                if (norm > 1e-12f) {
+                    for (int64_t d = 0; d < proj_cols; d++) {
+                        data[r * proj_cols + d] /= norm;
+                    }
+                }
+            }
+        }
 
         // ggml_sparse_attn expects:
         // q: [head_dim, n_head, n_batch]
@@ -2429,7 +2455,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_tensor * v_ssa = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
         cur = ggml_sparse_attn(ctx0, q_ssa, k_ssa, v_ssa, kq_mask, lsh_proj,
-                kq_scale, K, R, P, W, G);
+                kq_scale, K, R, P, W, G, 1);
         GGML_ASSERT(cur != NULL && "ggml_sparse_attn returned NULL");
         cb(cur, "ssa_attn", il);
 

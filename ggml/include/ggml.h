@@ -2452,7 +2452,8 @@ extern "C" {
             int32_t               num_hash_rounds,
             int32_t               max_num_hashes,
             int32_t               window_size,
-            int32_t               num_global_tokens);
+            int32_t               num_global_tokens,
+            int32_t               causal);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

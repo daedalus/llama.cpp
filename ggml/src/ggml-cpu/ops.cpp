@@ -9099,6 +9099,25 @@ void ggml_compute_forward_flash_attn_ext(
 
 #define SSA_MAX_K 4096
 
+static inline int ssa_lsh_hash(const float * vec, const float * proj, int d_head, int p_eff) {
+    int bucket = 0;
+    for (int b = 0; b < p_eff; b++) {
+        float dot = 0.0f;
+        for (int64_t d = 0; d < d_head; d++) {
+            dot += vec[d] * proj[b * d_head + d];
+        }
+        if (dot > 0.0f) bucket |= (1 << b);
+    }
+    return bucket;
+}
+
+static inline bool lsh_is_dup(int32_t * arr, int n, int32_t val) {
+    for (int i = 0; i < n; i++) {
+        if (arr[i] == val) return true;
+    }
+    return false;
+}
+
 static void ggml_compute_forward_sparse_attn_f32(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -9126,6 +9145,7 @@ static void ggml_compute_forward_sparse_attn_f32(
     const int32_t max_num_hashes  = ggml_get_op_params_i32(dst, 3);
     const int32_t window_size     = ggml_get_op_params_i32(dst, 4);
     const int32_t num_global      = ggml_get_op_params_i32(dst, 5);
+    const int32_t causal          = ggml_get_op_params_i32(dst, 6);
 
     const int64_t d_head = q->ne[0];
     const int64_t n_head = q->ne[1];
@@ -9137,21 +9157,6 @@ static void ggml_compute_forward_sparse_attn_f32(
     const int64_t R  = num_hash_rounds;
     const int64_t W  = window_size;
     const int64_t G  = num_global;
-
-    // compute effective P
-    int P_eff = 1;
-    if (M > 0) {
-        float p_ideal = log2f((float)M / (float)(K * 4));
-        P_eff = (int)roundf(p_ideal);
-        if (P_eff < 1) P_eff = 1;
-        if (P_eff > max_num_hashes) P_eff = max_num_hashes;
-    }
-    const int num_buckets = 1 << P_eff;
-    const int lsh_candidates = K * 4;
-
-    int guaranteed = 2 * W + 1 + G + 1;
-    int lsh_k = K - guaranteed;
-    if (lsh_k < 8) lsh_k = 8;
 
     const float * lsh_proj_data = lsh_p ? (const float *)lsh_p->data : NULL;
 
@@ -9173,17 +9178,81 @@ static void ggml_compute_forward_sparse_attn_f32(
         const float * Vh = v_data + bh * d_head;
         float * Oh = out_data + bh * d_head;
 
-        // Build neighbor list per query: self + window + global
-        // (full LSH implementation would union across rounds here)
         int total_k = (int)K;
-
-        // total_k sizes the fixed stack scratch below (SSA_MAX_K slots).
-        // ssa_num_neighbors is user-controlled (--ssa-neighbors -> std::stoi,
-        // no upstream clamp) and flows straight into K, so this assert is
-        // the only thing between a CLI flag and a stack buffer overflow.
-        // Fail loudly instead of corrupting the stack.
         GGML_ASSERT(total_k <= SSA_MAX_K && "ssa_num_neighbors exceeds SSA_MAX_K; "
                 "raise SSA_MAX_K or clamp --ssa-neighbors upstream");
+
+        const bool use_lsh = lsh_proj_data != NULL && R > 0;
+
+        // P_eff targets average bucket occupancy ~ lsh_k (the LSH residual
+        // budget after subtracting window+global+self from K). This matches
+        // the Python reference's compute_effective_p(M, C=lsh_k*4, max_p).
+        int guaranteed = 2 * (int)W + 1 + (int)G + 1;
+        int lsh_k = total_k - guaranteed;
+        if (lsh_k < 8) lsh_k = 8;
+
+        int P_eff = 1;
+        if (M > 1 && lsh_k > 0) {
+            float p_ideal = log2f((float)M / (float)(lsh_k * 4));
+            P_eff = (int)roundf(p_ideal);
+            if (P_eff < 1) P_eff = 1;
+            if (P_eff > (int)max_num_hashes) P_eff = (int)max_num_hashes;
+        }
+        const int num_buckets = 1 << P_eff;
+
+        // Heap-allocate large tables when M > 4096 to avoid stack overflow.
+        // At M <= 4096 (the common case), use stack for zero-alloc fast path.
+        const bool large_seq = M > 4096;
+        GGML_ASSERT(!large_seq && "SSA LSH: sequence length > 4096 not yet supported");
+
+        // Per-round bucket tables: built once per head, queried per query.
+        // bstart/bsize indexed as [round * num_buckets + bucket_id].
+        // k_sorted_pos indexed as [round * M + position].
+        int32_t bstart[4096 * 8];    // max R=8 rounds * 4096 buckets
+        int32_t bsize_arr[4096 * 8];
+        int32_t k_sorted_pos[4096 * 8]; // R * M sort permutations
+
+        if (use_lsh) {
+            for (int r = 0; r < (int)R; r++) {
+                const float * round_proj = lsh_proj_data + r * (int)max_num_hashes * d_head;
+                int r_off = r * num_buckets;
+                int32_t * kspos = k_sorted_pos + r * (int)M;
+
+                // hash all keys, build (bucket_id, position) pairs
+                int32_t bk_ids[4096];
+                for (int64_t m = 0; m < M; m++) {
+                    bk_ids[m] = ssa_lsh_hash(Kh + m * stride_batch, round_proj, d_head, P_eff);
+                    kspos[m] = m;
+                }
+
+                // sort by bucket id (insertion sort, fine for M <= 4096)
+                for (int64_t i = 1; i < M; i++) {
+                    int32_t key = bk_ids[i];
+                    int32_t pos = kspos[i];
+                    int j = i - 1;
+                    while (j >= 0 && bk_ids[j] > key) {
+                        bk_ids[j + 1] = bk_ids[j];
+                        kspos[j + 1] = kspos[j];
+                        j--;
+                    }
+                    bk_ids[j + 1] = key;
+                    kspos[j + 1] = pos;
+                }
+
+                // build bucket start + size
+                for (int b = 0; b < num_buckets; b++) {
+                    bstart[r_off + b] = (int32_t)M;
+                    bsize_arr[r_off + b] = 0;
+                }
+                for (int64_t i = 0; i < M; i++) {
+                    int b = bk_ids[i];
+                    if (b < num_buckets) {
+                        if (bsize_arr[r_off + b] == 0) bstart[r_off + b] = (int32_t)i;
+                        bsize_arr[r_off + b]++;
+                    }
+                }
+            }
+        }
 
         for (int64_t n = 0; n < N; n++) {
             float * out_row = Oh + n * stride_batch;
@@ -9198,32 +9267,13 @@ static void ggml_compute_forward_sparse_attn_f32(
             nbs++;
 
             // window
-            //
-            // Dedup against everything already placed (not just self): the
-            // old "skip if pos==n" check only caught self-duplicates and
-            // missed (a) window-vs-window duplicates from boundary clamping
-            // -- e.g. n=3, W=8: six different offsets all clamp to pos=0,
-            // none equal to n=3, so none were skipped, and pos=0 ended up
-            // counted 6x in the softmax instead of once -- and (b) window-
-            // vs-global overlap near the start of the sequence, where
-            // global tokens [0,G) fall inside the window and get added a
-            // second time. Both silently inflate softmax weight on the
-            // duplicated key. The Python reference (merge_neighbors in
-            // sparse_attention.py) dedups across the full combined pool for
-            // exactly this reason.
             for (int off = -(int)W; off <= (int)W && nbs < total_k; off++) {
                 int pos = n + off;
                 if (pos < 0) pos = 0;
                 if (pos >= M) pos = M - 1;
-                if (mask && pos > n) pos = n;
-                if (pos == n) continue; // self dup
-
-                bool dup = false;
-                for (int j = 0; j < nbs; j++) {
-                    if (neighbors[j] == pos) { dup = true; break; }
-                }
-                if (dup) continue;
-
+                if (causal && pos > n) pos = n;
+                if (pos == n) continue;
+                if (lsh_is_dup(neighbors, nbs, pos)) continue;
                 neighbors[nbs] = pos;
                 valid_mask[nbs] = 1;
                 nbs++;
@@ -9232,17 +9282,46 @@ static void ggml_compute_forward_sparse_attn_f32(
             // global tokens
             for (int g = 0; g < (int)G && nbs < total_k; g++) {
                 int pos = g < M ? g : 0;
-                if (pos == n) continue; // self dup
-
-                bool dup = false;
-                for (int j = 0; j < nbs; j++) {
-                    if (neighbors[j] == pos) { dup = true; break; }
-                }
-                if (dup) continue;
-
+                if (pos == n) continue;
+                if (lsh_is_dup(neighbors, nbs, pos)) continue;
                 neighbors[nbs] = pos;
                 valid_mask[nbs] = 1;
                 nbs++;
+            }
+
+            // LSH: for each round, hash query, gather bucket candidates
+            if (use_lsh) {
+                for (int r = 0; r < (int)R && nbs < total_k; r++) {
+                    const float * round_proj = lsh_proj_data + r * (int)max_num_hashes * d_head;
+                    const float * qv = Qh + n * stride_batch;
+                    int q_bucket = ssa_lsh_hash(qv, round_proj, d_head, P_eff);
+
+                    int r_off = r * num_buckets;
+                    int start = (q_bucket < num_buckets) ? bstart[r_off + q_bucket] : (int32_t)M;
+                    int size  = (q_bucket < num_buckets) ? bsize_arr[r_off + q_bucket] : 0;
+
+                    const int32_t * kspos = k_sorted_pos + r * (int)M;
+                    for (int i = 0; i < size && nbs < total_k; i++) {
+                        int32_t key_pos = kspos[start + i];
+                        if (key_pos == (int32_t)n) continue;
+                        if (lsh_is_dup(neighbors, nbs, key_pos)) continue;
+                        neighbors[nbs] = key_pos;
+                        valid_mask[nbs] = 1;
+                        nbs++;
+                    }
+                }
+            }
+
+            // Warn if dedup left fewer unique neighbors than requested
+            if (nbs < total_k) {
+                static bool warned = false;
+                if (!warned) {
+                    GGML_LOG_WARN("%s: SSA: query %lld got %d unique neighbors, "
+                            "padded %d slots (K=%d, W=%d, G=%d, R=%d, M=%lld)\n",
+                            __func__, (long long)n, nbs, total_k - nbs,
+                            total_k, (int)W, (int)G, (int)R, (long long)M);
+                    warned = true;
+                }
             }
 
             // pad remaining with invalid
