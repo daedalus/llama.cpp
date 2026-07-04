@@ -9097,6 +9097,8 @@ void ggml_compute_forward_flash_attn_ext(
 
 // ggml_compute_forward_sparse_attn
 
+#define SSA_MAX_K 4096
+
 static void ggml_compute_forward_sparse_attn_f32(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -9175,11 +9177,19 @@ static void ggml_compute_forward_sparse_attn_f32(
         // (full LSH implementation would union across rounds here)
         int total_k = (int)K;
 
+        // total_k sizes the fixed stack scratch below (SSA_MAX_K slots).
+        // ssa_num_neighbors is user-controlled (--ssa-neighbors -> std::stoi,
+        // no upstream clamp) and flows straight into K, so this assert is
+        // the only thing between a CLI flag and a stack buffer overflow.
+        // Fail loudly instead of corrupting the stack.
+        GGML_ASSERT(total_k <= SSA_MAX_K && "ssa_num_neighbors exceeds SSA_MAX_K; "
+                "raise SSA_MAX_K or clamp --ssa-neighbors upstream");
+
         for (int64_t n = 0; n < N; n++) {
             float * out_row = Oh + n * stride_batch;
 
-            int32_t neighbors[256];
-            uint8_t valid_mask[256];
+            int32_t neighbors[SSA_MAX_K];
+            uint8_t valid_mask[SSA_MAX_K];
             int nbs = 0;
 
             // self
@@ -9188,13 +9198,32 @@ static void ggml_compute_forward_sparse_attn_f32(
             nbs++;
 
             // window
+            //
+            // Dedup against everything already placed (not just self): the
+            // old "skip if pos==n" check only caught self-duplicates and
+            // missed (a) window-vs-window duplicates from boundary clamping
+            // -- e.g. n=3, W=8: six different offsets all clamp to pos=0,
+            // none equal to n=3, so none were skipped, and pos=0 ended up
+            // counted 6x in the softmax instead of once -- and (b) window-
+            // vs-global overlap near the start of the sequence, where
+            // global tokens [0,G) fall inside the window and get added a
+            // second time. Both silently inflate softmax weight on the
+            // duplicated key. The Python reference (merge_neighbors in
+            // sparse_attention.py) dedups across the full combined pool for
+            // exactly this reason.
             for (int off = -(int)W; off <= (int)W && nbs < total_k; off++) {
                 int pos = n + off;
                 if (pos < 0) pos = 0;
                 if (pos >= M) pos = M - 1;
                 if (mask && pos > n) pos = n;
-                // skip self duplicates
-                if (pos == n) continue;
+                if (pos == n) continue; // self dup
+
+                bool dup = false;
+                for (int j = 0; j < nbs; j++) {
+                    if (neighbors[j] == pos) { dup = true; break; }
+                }
+                if (dup) continue;
+
                 neighbors[nbs] = pos;
                 valid_mask[nbs] = 1;
                 nbs++;
@@ -9203,7 +9232,14 @@ static void ggml_compute_forward_sparse_attn_f32(
             // global tokens
             for (int g = 0; g < (int)G && nbs < total_k; g++) {
                 int pos = g < M ? g : 0;
-                if (pos == n) continue;
+                if (pos == n) continue; // self dup
+
+                bool dup = false;
+                for (int j = 0; j < nbs; j++) {
+                    if (neighbors[j] == pos) { dup = true; break; }
+                }
+                if (dup) continue;
+
                 neighbors[nbs] = pos;
                 valid_mask[nbs] = 1;
                 nbs++;
@@ -9217,7 +9253,7 @@ static void ggml_compute_forward_sparse_attn_f32(
             }
 
             // compute attention scores
-            float scores[256];
+            float scores[SSA_MAX_K];
             float max_score = -1e30f;
             for (int k_idx = 0; k_idx < total_k; k_idx++) {
                 if (!valid_mask[k_idx]) {
